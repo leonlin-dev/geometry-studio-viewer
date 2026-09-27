@@ -74,7 +74,28 @@ from ._helpers import (
 
 
 CASE_V1 = "1.0"
-SUPPORTED_CASE_VERSIONS = frozenset({"1.0", "1.1"})
+
+# Every case-envelope schema_version the validator accepts.
+#
+# This list and the CLI's dispatch used to disagree: the list carried "1.1"
+# while the dispatch tested `sv == CASE_V1` ("1.0") exactly, so a 1.1 envelope
+# was unreachable. Both now read from this one list.
+#
+# 1.2 and 1.3 are the versions 30-data's gallery envelopes actually carry.
+# 1.2 predates this file's allowlist and was rejected before it -- the
+# validator and the producer had drifted apart silently, because nothing ran
+# the CLI over the corpus. 1.3 is the same envelope with the debug block split
+# on ADR-013's consumer axis: written from a loft's result contract, stage 2
+# and stage 3 are legitimately empty.
+#
+# Newer versions are added here only. Adding a key does not by itself accept
+# the version: the structural checks below must already tolerate whatever the
+# new version added, and the corpus must pass. The validator requires keys and
+# never forbids extra ones, which is why 1.2's and 1.3's additional top-level
+# fields (process_audit, intermediate_products, constraint_visualizations,
+# support_surfaces, debug_markers, debug, moving_frame, sampling_plane, ...)
+# are accepted without changes here.
+SUPPORTED_CASE_VERSIONS = frozenset({"1.0", "1.1", "1.2", "1.3"})
 
 VALID_GEOMETRY_TYPES = frozenset({
     "LoftedSurface",

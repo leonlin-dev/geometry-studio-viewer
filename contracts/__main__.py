@@ -40,26 +40,48 @@ def _read_json(path: Path) -> Any:
                             code="JSON_PARSE_ERROR", path=str(path))
 
 
+def _classify(data: Any) -> str | None:
+    """Decide whether this document is a manifest or a case, by shape.
+
+    The version cannot decide it: MANIFEST_V1 and CASE_V1 are both "1.0", so
+    the old `if sv == MANIFEST_V1` first branch claimed every 1.0 document and
+    sent case envelopes to validate_manifest_v1, which then failed on their
+    missing "cases" list. Dispatching on structure instead means the two
+    version spaces are free to evolve independently, which they have to be --
+    the gallery envelopes are on 1.3 while the manifest is still on 1.0.
+
+    Shape test: a manifest carries a non-empty "cases" list (that is
+    manifest_v1's own required key); a case carries "caseName", which
+    case_v1 requires and a manifest never has.
+    """
+    cases = data.get("cases")
+    if isinstance(cases, list) and cases:
+        return "manifest"
+    if "caseName" in data:
+        return "case"
+    return None
+
+
 def cmd_validate(path: str) -> int:
     p = Path(path)
     data = _read_json(p)
     sv = data.get("schema_version")
-    if sv == MANIFEST_V1:
+    kind = _classify(data)
+    if kind == "manifest":
         validator = validate_manifest_v1
-        label = "manifest"
-    elif sv == CASE_V1:
+    elif kind == "case":
         validator = validate_case_v1
-        label = "case"
     else:
-        print(f"FAIL: {path}: unsupported schema_version={sv!r}; "
-              f"this package implements v{PACKAGE_VERSION}", file=sys.stderr)
+        print(f"FAIL: {path}: not a recognisable manifest or case envelope "
+              f"(schema_version={sv!r}); this package implements "
+              f"v{PACKAGE_VERSION}", file=sys.stderr)
         return 2
     try:
         validator(data)
     except ContractError as e:
         print(f"FAIL: {e}", file=sys.stderr)
         return 1
-    print(f"OK:   {path} ({label} v{sv})")
+    print(f"OK:   {path} ({kind} v{sv})")
     return 0
 
 
