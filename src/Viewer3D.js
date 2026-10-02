@@ -1367,6 +1367,7 @@ export class Viewer3D {
         guideBinding: 0x7b1fa2,
         lineDeclared: 0x1e88e5,
         lineDerived: 0xfb8c00,
+        lineGuideBinding: 0x7b1fa2,
     };
 
     /**
@@ -1382,7 +1383,10 @@ export class Viewer3D {
      *     same `profiles` array), ordered by v — the cross-profile
      *     connection chain; explicit world-space segments in `lines`
      *     (legacy ruling_lines) are rendered verbatim in the same
-     *     group;
+     *     group; guide bindings additionally get one polyline per
+     *     guide (same `guide_index`, ordered by profile_index then u)
+     *     so every coupling kind carries its own ordered connection
+     *     line, each distinguished by color;
      *   - guide bindings as separate-styled markers (purple octahedron)
      *     in their own toggleable sub-group.
      * Missing/null input (key absent) clears the group and hides it —
@@ -1532,6 +1536,41 @@ export class Viewer3D {
             mesh.userData.label = `guide_${gb.guide_index ?? '?'}_p${gb.profile_index ?? '?'}`;
             mesh.userData.kind = 'guide_binding';
             this.profileCouplingGuideBindingsGroup.add(mesh);
+        }
+
+        // --- guide-binding connection lines: one polyline per guide
+        // (bindings sharing the same `guide_index`), ordered by
+        // profile_index then u — the natural ordered chain across
+        // profiles. Rendered in the shared lines group (governed by the
+        // "Cross-profile Lines" toggle) in the guide-binding purple. ---
+        const guideGroups = new Map();
+        for (const gb of bindings) {
+            if (!gb || !Array.isArray(gb.position) || gb.position.length < 3) continue;
+            const key = gb.guide_index ?? -1;
+            if (!guideGroups.has(key)) guideGroups.set(key, []);
+            guideGroups.get(key).push(gb);
+        }
+        for (const [, gbs] of guideGroups) {
+            if (gbs.length < 2) continue;
+            const ordered = gbs.slice().sort((a, b) =>
+                (a.profile_index - b.profile_index) || (a.u - b.u));
+            const flat = [];
+            for (const gb of ordered) flat.push(gb.position[0], gb.position[1], gb.position[2]);
+            const lineGeom = new LineGeometry();
+            lineGeom.setPositions(flat);
+            const lineMat = new LineMaterial({
+                color: colors.lineGuideBinding,
+                linewidth: lineWidthPx,
+                transparent: true,
+                opacity: 0.85,
+                worldUnits: false,
+            });
+            lineMat.resolution.set(window.innerWidth, window.innerHeight);
+            const line = new Line2(lineGeom, lineMat);
+            line.computeLineDistances();
+            line.userData.kind = 'coupling_line_guide_binding';
+            line.userData.material = lineMat;
+            this.profileCouplingLinesGroup.add(line);
         }
 
         // Visible by default when data exists (Tab 2 hides surfaces and
