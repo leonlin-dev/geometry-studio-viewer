@@ -90,3 +90,11 @@
     background: rgba(25, 118, 210, 0.1);
     font-weight: 600;
 }
+/* Stride notice row shown in the Stations list when a densified
+   envelope (>16 stations) is being thinned via the Stride control. */
+.spine-frames-stride-note {
+    font-size: 10px;
+    color: #666;
+    padding: 2px 6px 6px;
+    font-style: italic;
+}

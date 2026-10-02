@@ -1,5 +1,6 @@
 import { Pane } from 'tweakpane';
 import { AuditPanel } from './AuditPanel.js';
+import { GeometryParser } from './GeometryParser.js';
 
 export class UIController {
     constructor(callbacks) {
@@ -341,6 +342,9 @@ export class UIController {
             showSeamMarkers: false,
             showTangentArrows: false,
             showRulingLines: false,
+            showCouplingPoints: true,
+            showCouplingLines: true,
+            showGuideBindings: true,
         };
         const stage1Folder = sidePane.addFolder({
             title: 'Stage 1 Overlays',
@@ -352,6 +356,44 @@ export class UIController {
             .on('change', (ev) => callbacks.onTangentArrowsToggle && callbacks.onTangentArrowsToggle(ev.value));
         stage1Folder.addBinding(params, 'showRulingLines', { label: 'Ruling Lines' })
             .on('change', (ev) => callbacks.onRulingLinesToggle && callbacks.onRulingLinesToggle(ev.value));
+
+        // Top-level `profile_coupling` overlays. Visible by default
+        // when the case carries data; the bindings dispatch through
+        // callbacks.onProfileCouplingToggle(kind, visible).
+        const pcFolder = sidePane.addFolder({
+            title: 'Profile Coupling Data',
+            expanded: true,
+        });
+        pcFolder.addBinding(params, 'showCouplingPoints', { label: 'Coupling Points' })
+            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('points', ev.value));
+        pcFolder.addBinding(params, 'showCouplingLines', { label: 'Connection Lines' })
+            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('lines', ev.value));
+        pcFolder.addBinding(params, 'showGuideBindings', { label: 'Guide Bindings' })
+            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('guide_bindings', ev.value));
+
+        const pcSummary = document.createElement('div');
+        pcSummary.style.fontFamily = 'monospace';
+        pcSummary.style.fontSize = '11px';
+        pcSummary.style.lineHeight = '1.5';
+        pcSummary.style.padding = '4px 6px';
+        pcSummary.style.color = '#333';
+        pcFolder.element.appendChild(pcSummary);
+        const renderCouplingSummary = (caseData) => {
+            pcSummary.innerHTML = '';
+            const pc = (caseData && caseData.debug && caseData.debug.profile_coupling) || null;
+            if (!pc) {
+                pcSummary.innerHTML = '<div style="color:#888;">No profile_coupling data for this case.</div>';
+                return;
+            }
+            const pts = Array.isArray(pc.coupling_points) ? pc.coupling_points : [];
+            const gbs = Array.isArray(pc.guide_bindings) ? pc.guide_bindings : [];
+            const declared = pts.filter((p) => p.kind === 'declared').length;
+            const derived = pts.length - declared;
+            pcSummary.innerHTML =
+                `<div>points: ${pts.length} <span style="color:#1e88e5;">(${declared} declared)</span>`
+                + ` <span style="color:#fb8c00;">(${derived} derived)</span></div>`
+                + `<div>guide bindings: ${gbs.length}</div>`;
+        };
 
         const diagFolder = sidePane.addFolder({
             title: 'Diagnostics (per profile)',
@@ -421,11 +463,18 @@ export class UIController {
             params,
             refresh(caseData) {
                 renderTable(caseData);
+                renderCouplingSummary(caseData);
             },
             resetStage1Toggles() {
                 params.showSeamMarkers = false;
                 params.showTangentArrows = false;
                 params.showRulingLines = false;
+                sidePane.refresh();
+            },
+            resetProfileCouplingToggles() {
+                params.showCouplingPoints = true;
+                params.showCouplingLines = true;
+                params.showGuideBindings = true;
                 sidePane.refresh();
             },
             dispose() {
@@ -485,6 +534,9 @@ export class UIController {
             showRibbon: true,
             showStations: true,
             planeScale: 1.0,
+            stride: 1,
+            stationCount: 0,
+            shownCount: 0,
         };
 
         const layersFolder = sidePane.addFolder({
@@ -511,6 +563,33 @@ export class UIController {
             step: 0.05,
         }).on('change', (ev) => callbacks.onPlaneScaleChange && callbacks.onPlaneScaleChange(ev.value));
 
+        // Density controls — visible only when the envelope carries
+        // more than 16 stations (densified backend emits 20-50). At
+        // stride 1 every entry renders.
+        const densityFolder = sidePane.addFolder({
+            title: 'Station Density',
+            expanded: true,
+        });
+        const strideBinding = densityFolder.addBinding(params, 'stride', {
+            label: 'Stride (every Nth)',
+            min: 1,
+            max: 50,
+            step: 1,
+        }).on('change', (ev) => {
+            if (callbacks.onStrideChange) callbacks.onStrideChange(ev.value);
+        });
+        strideBinding.hidden = true;
+        densityFolder.addBinding(params, 'stationCount', {
+            readonly: true,
+            label: 'Stations (total)',
+            format: (v) => String(v),
+        });
+        densityFolder.addBinding(params, 'shownCount', {
+            readonly: true,
+            label: 'Stations (shown)',
+            format: (v) => String(v),
+        });
+
         const stationFolder = sidePane.addFolder({
             title: 'Stations',
             expanded: true,
@@ -527,23 +606,52 @@ export class UIController {
         stationFolder.element.appendChild(stationBody);
 
         let stationEntries = [];
+        let stationIdxByRow = [];
         let activeStationIdx = null;
         const onStationClick = (callbacks && callbacks.onStationClick) || (() => {});
 
         const renderStations = (caseData) => {
             stationBody.innerHTML = '';
             stationEntries = [];
-            const dbg = (caseData && caseData.debug && caseData.debug.stage3_spine_frames) || null;
-            const frames = (dbg && Array.isArray(dbg.frames)) ? dbg.frames : [];
-            if (frames.length === 0) {
+            stationIdxByRow = [];
+            let frames = [];
+            try {
+                const parsed = GeometryParser.parseSpineFrameData(caseData);
+                frames = (parsed && Array.isArray(parsed.frames)) ? parsed.frames : [];
+            } catch (e) {
+                frames = [];
+            }
+            const total = frames.length;
+            const stride = Math.max(1, Math.floor(
+                Number((callbacks.getStride && callbacks.getStride()) || 1)));
+            const shown = (stride <= 1) ? total : Math.ceil(total / stride);
+
+            // Density controls only matter for densified (>16 station)
+            // envelopes; hide them (and show everything) otherwise.
+            strideBinding.hidden = total <= 16;
+            params.stationCount = total;
+            params.shownCount = shown;
+            if (strideBinding.refresh) strideBinding.refresh();
+
+            if (total === 0) {
                 const empty = document.createElement('div');
                 empty.style.color = '#888';
-                empty.textContent = 'No stage3_spine_frames for this case.';
+                empty.textContent = 'No spine frames / sampling planes for this case.';
                 stationBody.appendChild(empty);
                 activeStationIdx = null;
                 return;
             }
+            if (stride > 1) {
+                const note = document.createElement('div');
+                note.className = 'spine-frames-stride-note';
+                note.textContent = `Stride ${stride}: showing ${shown} of ${total} stations.`;
+                stationBody.appendChild(note);
+            }
             frames.forEach((f, idx) => {
+                // Strided view: list (and click-target) only the rows
+                // the 3D panel actually renders, so row -> highlight
+                // indices stay aligned.
+                if (stride > 1 && (idx % stride) !== 0) return;
                 const row = document.createElement('div');
                 row.className = 'spine-frames-station-row';
                 row.style.display = 'flex';
@@ -556,13 +664,16 @@ export class UIController {
                 row.style.border = '1px solid #e0e0e0';
                 row.style.background = '#fafafa';
                 const v = (typeof f.v === 'number') ? f.v.toFixed(3) : '?';
-                row.innerHTML = `<span>Station ${idx}</span><span style="color:#555;">v=${v}</span>`;
+                const label = (stride > 1) ? `Station ${idx} [${idx / stride}]` : `Station ${idx}`;
+                row.innerHTML = `<span>${label}</span>`
+                    + `<span style="color:#555;">v=${v}</span>`;
                 row.addEventListener('click', () => {
                     setActiveStation(idx);
-                    onStationClick(idx);
+                    onStationClick(stride > 1 ? idx / stride : idx);
                 });
                 stationBody.appendChild(row);
                 stationEntries.push(row);
+                stationIdxByRow.push(idx);
             });
         };
 
@@ -574,7 +685,7 @@ export class UIController {
             }
             activeStationIdx = idx;
             stationEntries.forEach((el, k) => {
-                el.classList.toggle('active', k === idx);
+                el.classList.toggle('active', stationIdxByRow[k] === idx);
             });
         };
 

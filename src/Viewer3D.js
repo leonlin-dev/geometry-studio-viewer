@@ -29,6 +29,19 @@ export class Viewer3D {
         this.seamMarkersGroup.visible = false;
         this.tangentArrowsGroup.visible = false;
         this.rulingLinesGroup.visible = false;
+        // Top-level `profile_coupling` overlays (coupling points +
+        // cross-profile connection lines + guide bindings). Built by
+        // setProfileCoupling; per-layer visibility driven by
+        // setProfileCouplingLayerVisibility. Group stays invisible
+        // until a case actually carries the data.
+        this.profileCouplingGroup = new THREE.Group();
+        this.profileCouplingPointsGroup = new THREE.Group();
+        this.profileCouplingLinesGroup = new THREE.Group();
+        this.profileCouplingGuideBindingsGroup = new THREE.Group();
+        this.profileCouplingGroup.add(this.profileCouplingPointsGroup);
+        this.profileCouplingGroup.add(this.profileCouplingLinesGroup);
+        this.profileCouplingGroup.add(this.profileCouplingGuideBindingsGroup);
+        this.profileCouplingGroup.visible = false;
         this.surfaceGroups = {};
         this.auditLayers = {};
         this.vSamplesPoints = null;
@@ -52,6 +65,7 @@ export class Viewer3D {
         this.scene.add(this.seamMarkersGroup);
         this.scene.add(this.tangentArrowsGroup);
         this.scene.add(this.rulingLinesGroup);
+        this.scene.add(this.profileCouplingGroup);
 
         this.material = new THREE.MeshPhongMaterial({
             color: 0x4488ff,
@@ -1340,6 +1354,168 @@ export class Viewer3D {
             `Viewer3D: stage1_coupling built (seams=${seams.length}, `
             + `ruling_lines=${rulingLines.length}, diagonal=${diagonal.toFixed(3)}).`
         );
+    }
+
+    // ---- top-level `profile_coupling` overlay renderer --------------------
+
+    // Kind styling: declared (blue sphere) vs derived (orange octahedron)
+    // vs guide bindings (purple octahedron, flatter + distinct family).
+    static PROFILE_COUPLING_COLORS = {
+        declared: 0x1e88e5,
+        derived: 0xfb8c00,
+        guideBinding: 0x7b1fa2,
+        lineDeclared: 0x1e88e5,
+        lineDerived: 0xfb8c00,
+    };
+
+    /**
+     * Build the profile-coupling visualization from a normalized
+     * GeometryParser.parseProfileCoupling() envelope:
+     *   - one marker per coupling point (sphere = declared, octahedron
+     *     = derived) with optional label sprite;
+     *   - one thick polyline per coupling group (points sharing the
+     *     same `profiles` array), ordered by v — the cross-profile
+     *     connection chain; line color follows the group's kind;
+     *   - guide bindings as separate-styled markers (purple octahedron)
+     *     in their own toggleable sub-group.
+     * Missing/null input (key absent) clears the group and hides it —
+     * a strict no-op relative to pre-`profile_coupling` behavior.
+     */
+    setProfileCoupling(coupling) {
+        const grp = this.profileCouplingGroup;
+        if (!grp) return;
+        // Rebuild from scratch on every call (case change = fresh state).
+        const clear = (g) => {
+            while (g.children.length > 0) {
+                const child = g.children[0];
+                g.remove(child);
+                this._disposeProfileCouplingObject(child);
+            }
+        };
+        clear(this.profileCouplingPointsGroup);
+        clear(this.profileCouplingLinesGroup);
+        clear(this.profileCouplingGuideBindingsGroup);
+        if (!coupling || typeof coupling !== 'object') {
+            grp.visible = false;
+            return;
+        }
+        this._recomputeStage1BBox();
+        const diagonal = (this.stage1BBox && this.stage1BBox.diagonal) || 1.0;
+        const markerRadius = Math.max(0.005, Math.min(0.2, diagonal * 0.012));
+        const colors = Viewer3D.PROFILE_COUPLING_COLORS;
+
+        const points = Array.isArray(coupling.coupling_points) ? coupling.coupling_points : [];
+        const bindings = Array.isArray(coupling.guide_bindings) ? coupling.guide_bindings : [];
+
+        // --- markers (one per coupling point) ---
+        for (const cp of points) {
+            if (!cp || !Array.isArray(cp.position) || cp.position.length < 3) continue;
+            const [x, y, z] = cp.position;
+            const derived = cp.kind === 'derived';
+            const color = derived ? colors.derived : colors.declared;
+            const geom = derived
+                ? new THREE.OctahedronGeometry(markerRadius, 0)
+                : new THREE.SphereGeometry(markerRadius, 16, 16);
+            const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color }));
+            mesh.position.set(x, y, z);
+            mesh.userData.label = cp.label || `cp_v${cp.v ?? '?'}`;
+            mesh.userData.kind = derived ? 'coupling_point_derived' : 'coupling_point_declared';
+            this.profileCouplingPointsGroup.add(mesh);
+            if (cp.label) {
+                try {
+                    const sprite = this._makeAnnoSprite(cp.label, color, 0.5);
+                    sprite.position.set(x, y + markerRadius * 1.8, z);
+                    sprite.userData.label = cp.label;
+                    this.profileCouplingPointsGroup.add(sprite);
+                } catch (e) { /* label sprites are best-effort */ }
+            }
+        }
+
+        // --- cross-profile connection lines: one polyline per coupling
+        // group (points sharing the same `profiles` array), ordered by v. ---
+        const groups = new Map();
+        for (const cp of points) {
+            if (!cp || !Array.isArray(cp.position) || cp.position.length < 3) continue;
+            const key = Array.isArray(cp.profiles) ? cp.profiles.join(',') : '';
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(cp);
+        }
+        const screenSize = () => Math.max(1, Math.min(window.innerWidth, window.innerHeight));
+        const lineWidthPx = Math.max(2, Math.min(4, screenSize() * 0.003));
+        for (const [, groupPoints] of groups) {
+            if (groupPoints.length < 2) continue;
+            const ordered = groupPoints.slice().sort((a, b) => a.v - b.v);
+            const flat = [];
+            for (const cp of ordered) flat.push(cp.position[0], cp.position[1], cp.position[2]);
+            const derived = ordered.some((cp) => cp.kind === 'derived');
+            const color = derived ? colors.lineDerived : colors.lineDeclared;
+            const lineGeom = new LineGeometry();
+            lineGeom.setPositions(flat);
+            const lineMat = new LineMaterial({
+                color,
+                linewidth: lineWidthPx,
+                transparent: true,
+                opacity: 0.85,
+                worldUnits: false,
+            });
+            lineMat.resolution.set(window.innerWidth, window.innerHeight);
+            const line = new Line2(lineGeom, lineMat);
+            line.computeLineDistances();
+            line.userData.kind = derived ? 'coupling_line_derived' : 'coupling_line_declared';
+            line.userData.material = lineMat;
+            this.profileCouplingLinesGroup.add(line);
+        }
+
+        // --- guide bindings: separate style (purple octahedron) ---
+        for (const gb of bindings) {
+            if (!gb || !Array.isArray(gb.position) || gb.position.length < 3) continue;
+            const [x, y, z] = gb.position;
+            const geom = new THREE.OctahedronGeometry(markerRadius * 0.8, 0);
+            const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color: colors.guideBinding }));
+            mesh.position.set(x, y, z);
+            mesh.rotation.z = Math.PI / 4; // visually distinct silhouette
+            mesh.userData.label = `guide_${gb.guide_index ?? '?'}_p${gb.profile_index ?? '?'}`;
+            mesh.userData.kind = 'guide_binding';
+            this.profileCouplingGuideBindingsGroup.add(mesh);
+        }
+
+        // Visible by default when data exists (Tab 2 hides surfaces and
+        // shows the skeleton + coupling overlays; the Stage-1 debug
+        // overlays stay default-OFF, these are the primary data view).
+        grp.visible = true;
+        this.profileCouplingPointsGroup.visible = true;
+        this.profileCouplingLinesGroup.visible = true;
+        this.profileCouplingGuideBindingsGroup.visible = true;
+        console.info(
+            `Viewer3D: profile_coupling built (points=${points.length}, `
+            + `lines=${this.profileCouplingLinesGroup.children.length}, `
+            + `guide_bindings=${bindings.length}).`
+        );
+    }
+
+    /**
+     * Per-layer visibility for the profile_coupling overlays.
+     * kind ∈ { 'points', 'lines', 'guide_bindings' }.
+     */
+    setProfileCouplingLayerVisibility(kind, visible) {
+        const target = (kind === 'points') ? this.profileCouplingPointsGroup
+            : (kind === 'lines') ? this.profileCouplingLinesGroup
+            : (kind === 'guide_bindings') ? this.profileCouplingGuideBindingsGroup
+            : null;
+        if (target) target.visible = !!visible;
+    }
+
+    _disposeProfileCouplingObject(obj) {
+        obj.traverse((child) => {
+            if (child.geometry) child.geometry.dispose();
+            const mats = Array.isArray(child.material) ? child.material
+                : (child.material ? [child.material] : []);
+            mats.forEach((m) => m.dispose());
+        });
+        if (obj.geometry) obj.geometry.dispose();
+        const mats = Array.isArray(obj.material) ? obj.material
+            : (obj.material ? [obj.material] : []);
+        mats.forEach((m) => m.dispose());
     }
 
     /**

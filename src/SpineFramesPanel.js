@@ -68,6 +68,7 @@ export class SpineFramesPanel {
             stations: true,
         };
         this._planeScale = 1.0;
+        this._stride = 1;
         this._highlightedStation = null;
 
         this.scene = null;
@@ -83,6 +84,8 @@ export class SpineFramesPanel {
         this.skeletonShadow = null;
 
         this._frames = [];
+        this._allFrames = [];
+        this._allPlanes = [];
         this._stationMeshes = [];
         this._frameArrows = [];
         this._planeMeshes = [];
@@ -103,6 +106,7 @@ export class SpineFramesPanel {
     update(newCaseData) {
         this.caseData = newCaseData || null;
         this._highlightedStation = null;
+        this._stride = 1;
         this._applyData(this.caseData);
     }
 
@@ -142,6 +146,8 @@ export class SpineFramesPanel {
         this._planeGrids = [];
         this._ribbonMesh = null;
         this._frames = [];
+        this._allFrames = [];
+        this._allPlanes = [];
     }
 
     setStationHighlight(idx) {
@@ -160,6 +166,29 @@ export class SpineFramesPanel {
         this._planeScale = m;
         this._rebuildPlanes();
         this._applyHighlight();
+    }
+
+    /**
+     * Thin the display: render only every Nth entry of the frames /
+     * sampling-plane arrays. 1 = show all (the default whenever the
+     * station count is <= 16); the side panel only exposes the control
+     * for denser envelopes.
+     */
+    setStride(stride) {
+        const s = Math.max(1, Math.floor(Number(stride) || 1));
+        if (s === this._stride) return;
+        this._stride = s;
+        this._highlightedStation = null;
+        this._applyData(this.caseData);
+    }
+
+    getStride() {
+        return this._stride;
+    }
+
+    /** Total (un-strided) frame-station count of the current case. */
+    getStationCount() {
+        return this._allFrames.length;
     }
 
     toggleLayer(name, visible) {
@@ -289,6 +318,30 @@ export class SpineFramesPanel {
 
     // ---- data extraction -------------------------------------------------
 
+    /**
+     * Unified extraction: full triad stations (frames) + oriented plane
+     * stations (samplingPlanes) via GeometryParser.parseSpineFrameData.
+     * Falls back to the legacy stage3-only _extractFrames path when the
+     * parser predates parseSpineFrameData. No assumption is made about
+     * array length — 2-entry legacy envelopes and 20-50 station dense
+     * envelopes flow through the same path.
+     */
+    _extractData(caseData) {
+        let frames = [];
+        let planes = [];
+        if (this._parser && typeof this._parser.parseSpineFrameData === 'function') {
+            const d = this._parser.parseSpineFrameData(caseData);
+            if (d) {
+                frames = Array.isArray(d.frames) ? d.frames : [];
+                planes = Array.isArray(d.samplingPlanes) ? d.samplingPlanes : [];
+            }
+        }
+        if (frames.length === 0 && planes.length === 0) {
+            frames = this._extractFrames(caseData);
+        }
+        return { frames, planes };
+    }
+
     _extractFrames(caseData) {
         if (!this._parser || typeof this._parser.parseDebug !== 'function') return [];
         let dbg = null;
@@ -354,9 +407,22 @@ export class SpineFramesPanel {
 
     _applyData(caseData) {
         this._clearVizGroups();
-        const frames = this._extractFrames(caseData);
+        const { frames: allFrames, planes: allPlanes } = this._extractData(caseData);
+        this._allFrames = allFrames;
+        this._allPlanes = allPlanes;
+
+        // Stride thinning: keep every Nth entry. Both arrays are
+        // index-aligned per spec 0002, so the same stride preserves
+        // frame/plane pairing.
+        const stride = this._stride;
+        const pick = (arr) => (stride <= 1
+            ? arr
+            : arr.filter((_, i) => (i % stride) === 0));
+        const frames = pick(allFrames);
+        const planes = pick(allPlanes);
         this._frames = frames;
-        if (frames.length === 0) {
+
+        if (frames.length === 0 && planes.length === 0) {
             this._fitCameraToFallback();
             return;
         }
@@ -380,7 +446,7 @@ export class SpineFramesPanel {
             this._addFrameArrows(f, lRef);
         });
 
-        this._rebuildPlanes();
+        this._rebuildPlanes(planes);
         this._rebuildRibbon();
 
         this._applyLayerVisibility();
@@ -407,7 +473,14 @@ export class SpineFramesPanel {
         this._frameArrows.push({ t: tArrow, n: nArrow, b: bArrow });
     }
 
-    _rebuildPlanes() {
+    /**
+     * Rebuild the plane overlay. `planeEntries` carries the (already
+     * strided) sampling_plane stations {origin, normal, axis_u,
+     * axis_v}; when absent (legacy stage3-only envelopes) the planes
+     * are derived from the frame stations' binormal/normal pair, the
+     * pre-existing behavior. Any number of planes is supported.
+     */
+    _rebuildPlanes(planeEntries) {
         for (const m of this._planeMeshes) {
             this.planesGroup.remove(m);
             this._disposeObject3D(m);
@@ -424,12 +497,17 @@ export class SpineFramesPanel {
         this._planeOutlines = [];
         this._planeGrids = [];
 
-        if (this._frames.length === 0) return;
+        let defs = planeEntries;
+        if (!Array.isArray(defs) || defs.length === 0) {
+            defs = this._frames.map((f, idx) => ({
+                origin: f.origin, normal: f.normal,
+                axis_u: f.binormal, axis_v: f.normal, idx,
+            }));
+        }
+        if (defs.length === 0) return;
 
         const lRef = this._computeLRef();
-        const halfW = lRef * this._planeScale;
-        const halfH = lRef * this._planeScale;
-        const planeGeom = new THREE.PlaneGeometry(halfW * 2, halfH * 2);
+        const planeGeom = new THREE.PlaneGeometry(2, 2);
 
         const planeMat = new THREE.MeshBasicMaterial({
             color: COLOR_PLANE,
@@ -440,12 +518,22 @@ export class SpineFramesPanel {
 
         const edgeMat = new THREE.LineBasicMaterial({ color: COLOR_PLANE_EDGE });
 
-        this._frames.forEach((f, idx) => {
-            const origin = new THREE.Vector3(f.origin[0], f.origin[1], f.origin[2]);
-            const nDir = new THREE.Vector3(f.normal[0], f.normal[1], f.normal[2]).normalize();
-            const bDir = new THREE.Vector3(f.binormal[0], f.binormal[1], f.binormal[2]).normalize();
+        defs.forEach((d, k) => {
+            const origin = new THREE.Vector3(d.origin[0], d.origin[1], d.origin[2]);
+            const nDir = new THREE.Vector3(d.normal[0], d.normal[1], d.normal[2]).normalize();
+            const uLen = Math.hypot(d.axis_u[0], d.axis_u[1], d.axis_u[2]);
+            const vLen = Math.hypot(d.axis_v[0], d.axis_v[1], d.axis_v[2]);
+            // axis_u / axis_v are the plane's unit spanning directions;
+            // scale their (clamped, finite) magnitudes by L_ref and the
+            // user's plane-scale slider.
+            const halfW = lRef * this._planeScale
+                * (Number.isFinite(uLen) && uLen > 1e-9 ? Math.min(uLen, 10) : 1);
+            const halfH = lRef * this._planeScale
+                * (Number.isFinite(vLen) && vLen > 1e-9 ? Math.min(vLen, 10) : 1);
+            const bDir = new THREE.Vector3(d.axis_u[0], d.axis_u[1], d.axis_u[2]).normalize();
 
             const plane = new THREE.Mesh(planeGeom, planeMat);
+            plane.scale.set(halfW, halfH, 1);
             plane.position.copy(origin);
             // PlaneGeometry lies in the XY plane; rotate so its surface
             // spans the N-B plane. Use a quaternion from the default
@@ -453,7 +541,7 @@ export class SpineFramesPanel {
             const defaultNormal = new THREE.Vector3(0, 0, 1);
             const quat = new THREE.Quaternion().setFromUnitVectors(defaultNormal, nDir);
             plane.quaternion.copy(quat);
-            plane.userData = { kind: 'sampling_plane', idx };
+            plane.userData = { kind: 'sampling_plane', k };
             this.planesGroup.add(plane);
             this._planeMeshes.push(plane);
 
@@ -481,7 +569,7 @@ export class SpineFramesPanel {
             );
             const outline = new THREE.LineSegments(outlineGeom, edgeMat);
             outline.position.copy(origin);
-            outline.userData = { kind: 'plane_outline', idx };
+            outline.userData = { kind: 'plane_outline', k };
             this.planesGroup.add(outline);
             this._planeOutlines.push(outline);
 
@@ -525,7 +613,7 @@ export class SpineFramesPanel {
                     gridGeom,
                     new THREE.LineBasicMaterial({ color: 0xaaaaaa, transparent: true, opacity: 0.35 })
                 );
-                grid.userData = { kind: 'plane_grid', idx };
+                grid.userData = { kind: 'plane_grid', k };
                 this.planesGroup.add(grid);
                 this._planeGrids.push(grid);
             }

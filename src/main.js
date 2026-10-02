@@ -247,6 +247,7 @@ class App {
                 onSeamMarkersToggle: (v) => this.viewer.setSeamMarkersVisibility(v),
                 onTangentArrowsToggle: (v) => this.viewer.setTangentArrowsVisibility(v),
                 onRulingLinesToggle: (v) => this.viewer.setRulingLinesVisibility(v),
+                onProfileCouplingToggle: (kind, v) => this.viewer.setProfileCouplingLayerVisibility(kind, v),
             }) : null;
         }
         if (this.couplingPanel && this.currentCaseData) {
@@ -311,6 +312,17 @@ class App {
                         && typeof this.spineFramesPanel.setPlaneScale === 'function') {
                         this.spineFramesPanel.setPlaneScale(m);
                     }
+                },
+                onStrideChange: (n) => {
+                    if (this.spineFramesPanel
+                        && typeof this.spineFramesPanel.setStride === 'function') {
+                        this.spineFramesPanel.setStride(n);
+                    }
+                },
+                getStride: () => {
+                    return (this.spineFramesPanel
+                        && typeof this.spineFramesPanel.getStride === 'function')
+                        ? this.spineFramesPanel.getStride() : 1;
                 },
                 onStationClick: (idx) => {
                     if (this.spineFramesPanel
@@ -803,7 +815,7 @@ class App {
             return;
         }
 
-        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug } = GeometryParser.parseMesh(jsonData);
+        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug, profileCoupling } = GeometryParser.parseMesh(jsonData);
         // spec 0002: bundle aux-viz arrays; loadMesh builds the
         // groups AFTER bbox is known (scale = 0.1 × bbox_diagonal).
         const extras = { movingFrame, samplingPlane };
@@ -829,6 +841,13 @@ class App {
         // from case.debug.stage1_coupling when present. The renderer
         // handles missing input as a no-op + console.info.
         this.viewer.setCouplingDebug(debug ? debug.stage1_coupling : null);
+        // Top-level `profile_coupling` overlays: built when present,
+        // cleared + hidden when absent (null) so absence of the key is
+        // visually identical to pre-`profile_coupling` cases.
+        this.viewer.setProfileCoupling(profileCoupling || null);
+        if (this.couplingPanel && typeof this.couplingPanel.resetProfileCouplingToggles === 'function') {
+            this.couplingPanel.resetProfileCouplingToggles();
+        }
         // Reset Stage-1 + Stage-2 checkboxes on every case change so a
         // reviewer can't be left looking at seam markers from a
         // previous case that the current case doesn't actually carry.

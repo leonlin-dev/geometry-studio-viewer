@@ -85,6 +85,11 @@ export class GeometryParser {
             // U-basis timeline). Optional — older cases predate this
             // schema and the renderer treats its absence as no-op.
             debug: this.parseDebug(jsonData),
+            // Top-level `profile_coupling` envelope (coupling points +
+            // guide bindings). Optional — normalized by the single
+            // mapping in normalizeProfileCoupling(); null when absent
+            // so consumers guard with one null-check.
+            profileCoupling: this.parseProfileCoupling(jsonData),
         };
     }
 
@@ -104,12 +109,14 @@ export class GeometryParser {
         const stage2Timeline = this._parseStage2Timeline(dbg.stage2_basis_u_timeline);
         const stage3Frames = this._parseStage3SpineFrames(dbg.stage3_spine_frames);
         const stage4Manifold = this._parseStage4TheoreticalManifold(dbg.stage4_theoretical_manifold);
-        if (!stage1Coupling && !stage2Timeline && !stage3Frames && !stage4Manifold) return null;
+        const profileCoupling = this.parseProfileCoupling(jsonData);
+        if (!stage1Coupling && !stage2Timeline && !stage3Frames && !stage4Manifold && !profileCoupling) return null;
         return {
             stage1_coupling: stage1Coupling,
             stage2_basis_u_timeline: stage2Timeline,
             stage3_spine_frames: stage3Frames,
             stage4_theoretical_manifold: stage4Manifold,
+            profile_coupling: profileCoupling,
         };
     }
 
@@ -156,6 +163,129 @@ export class GeometryParser {
         }
         if (seams.length === 0 && rulingLines.length === 0) return null;
         return { seams, ruling_lines: rulingLines };
+    }
+
+    /**
+     * Top-level `profile_coupling` envelope (concurrent backend change):
+     *   {
+     *     "coupling_points": [ { v, u, position:[x,y,z], profiles:[int,...],
+     *                            kind: "declared"|"derived", label } ... ],
+     *     "guide_bindings":  [ { guide_index, profile_index, u,
+     *                            position:[x,y,z] } ... ]
+     *   }
+     *
+     * normalizeProfileCoupling is the SINGLE centralized mapping layer
+     * from backend field names to the viewer's internal shape. If the
+     * backend renames a field, add an alias here — nothing else in the
+     * viewer needs to change. Returns null when the key is absent or
+     * carries no usable entries (absence-of-key → null → renderer and
+     * panel both treat it as "not available", i.e. exactly today's
+     * empty-state behavior).
+     *
+     * Internal (normalized) shape — what Viewer3D / UIController consume:
+     *   {
+     *     coupling_points: [ { v, u, position:[x,y,z], profiles:[int,...],
+     *                          kind:'declared'|'derived', label } ],
+     *     guide_bindings:  [ { guide_index, profile_index, u, position:[x,y,z] } ]
+     *   }
+     */
+    static normalizeProfileCoupling(raw) {
+        if (!raw || typeof raw !== 'object') return null;
+
+        // --- field-name aliases (backend rename = edit these lines) ---
+        const pick = (obj, names) => {
+            for (const n of names) {
+                if (obj && obj[n] !== undefined && obj[n] !== null) return obj[n];
+            }
+            return undefined;
+        };
+        const CP_ALIASES = {
+            v: ['v', 'v_param', 'v_value'],
+            u: ['u', 'u_param', 'u_value'],
+            position: ['position', 'pos', 'xyz', 'point'],
+            profiles: ['profiles', 'profile_indices', 'profile_ids'],
+            kind: ['kind', 'type', 'coupling_kind'],
+            label: ['label', 'name'],
+        };
+        const GB_ALIASES = {
+            guide_index: ['guide_index', 'guide', 'guide_id'],
+            profile_index: ['profile_index', 'profile', 'profile_id'],
+            u: ['u', 'u_param', 'u_value'],
+            position: ['position', 'pos', 'xyz', 'point'],
+        };
+
+        const readVec3 = (value) => {
+            if (!Array.isArray(value) || value.length < 3) return null;
+            const [x, y, z] = value;
+            if (![x, y, z].every((n) => Number.isFinite(n))) return null;
+            return [x, y, z];
+        };
+
+        const couplingPoints = [];
+        const cpListRaw = pick(raw, ['coupling_points', 'couplingPoints', 'points']);
+        if (Array.isArray(cpListRaw)) {
+            for (const cp of cpListRaw) {
+                if (!cp || typeof cp !== 'object') continue;
+                const position = readVec3(pick(cp, CP_ALIASES.position));
+                if (!position) continue;
+                const vRaw = pick(cp, CP_ALIASES.v);
+                const uRaw = pick(cp, CP_ALIASES.u);
+                const profilesRaw = pick(cp, CP_ALIASES.profiles);
+                const kindRaw = pick(cp, CP_ALIASES.kind);
+                const labelRaw = pick(cp, CP_ALIASES.label);
+                const kind = (kindRaw === 'derived') ? 'derived' : 'declared';
+                couplingPoints.push({
+                    v: Number.isFinite(vRaw) ? vRaw : 0,
+                    u: Number.isFinite(uRaw) ? uRaw : 0,
+                    position,
+                    profiles: Array.isArray(profilesRaw)
+                        ? profilesRaw.filter((n) => Number.isInteger(n))
+                        : [],
+                    kind,
+                    label: (typeof labelRaw === 'string') ? labelRaw : '',
+                });
+            }
+        }
+
+        const guideBindings = [];
+        const gbListRaw = pick(raw, ['guide_bindings', 'guideBindings', 'bindings']);
+        if (Array.isArray(gbListRaw)) {
+            for (const gb of gbListRaw) {
+                if (!gb || typeof gb !== 'object') continue;
+                const position = readVec3(pick(gb, GB_ALIASES.position));
+                if (!position) continue;
+                const guideIdx = pick(gb, GB_ALIASES.guide_index);
+                const profileIdx = pick(gb, GB_ALIASES.profile_index);
+                const uRaw = pick(gb, GB_ALIASES.u);
+                guideBindings.push({
+                    guide_index: Number.isInteger(guideIdx) ? guideIdx : -1,
+                    profile_index: Number.isInteger(profileIdx) ? profileIdx : -1,
+                    u: Number.isFinite(uRaw) ? uRaw : 0,
+                    position,
+                });
+            }
+        }
+
+        if (couplingPoints.length === 0 && guideBindings.length === 0) return null;
+        return { coupling_points: couplingPoints, guide_bindings: guideBindings };
+    }
+
+    /**
+     * Parse the optional top-level `profile_coupling` key via the
+     * centralized normalizeProfileCoupling mapping. Returns null when
+     * the key is absent (the overwhelmingly common legacy case) so
+     * callers short-circuit with a single null-check and the viewer
+     * behaves exactly as before this schema existed.
+     */
+    static parseProfileCoupling(jsonData) {
+        const raw = jsonData && jsonData.profile_coupling;
+        if (!raw || typeof raw !== 'object') return null;
+        try {
+            return this.normalizeProfileCoupling(raw);
+        } catch (e) {
+            console.warn('GeometryParser: failed to normalize profile_coupling —', e);
+            return null;
+        }
     }
 
     /**
@@ -309,6 +439,80 @@ export class GeometryParser {
         }
         if (frames.length === 0) return null;
         return { knots_v: knotsV, distinct_v_stations: distinctV, frames };
+    }
+
+    /**
+     * Unified Spine & Frame station model for Tab 4 (SpineFramesPanel).
+     * Returns { frames, samplingPlanes } where
+     *   frames         — stations carrying a full triad (v, origin,
+     *                    tangent, normal, binormal); taken from
+     *                    debug.stage3_spine_frames when present, else
+     *                    validated from the top-level moving_frame[].
+     *   samplingPlanes — stations carrying an oriented plane (v, origin,
+     *                    normal, axis_u, axis_v) from the top-level
+     *                    sampling_plane[]. Planes are independent of
+     *                    frames so an envelope with planes only still
+     *                    renders.
+     * Both arrays keep every valid entry (any count — the densified
+     * backend emits 20-50 stations); malformed entries are skipped.
+     */
+    static parseSpineFrameData(jsonData) {
+        const frames = [];
+        const samplingPlanes = [];
+        const dbg = this.parseDebug(jsonData);
+        const stage3 = (dbg && dbg.stage3_spine_frames) ? dbg.stage3_spine_frames : null;
+        if (stage3 && Array.isArray(stage3.frames)) {
+            for (const f of stage3.frames) {
+                if (f && Array.isArray(f.origin)) {
+                    frames.push({
+                        v: f.v, origin: f.origin, tangent: f.tangent,
+                        normal: f.normal, binormal: f.binormal,
+                    });
+                }
+            }
+        }
+        if (frames.length === 0) {
+            const mf = this.parseMovingFrame(jsonData);
+            if (mf) {
+                for (const f of mf) {
+                    if (!f || typeof f !== 'object') continue;
+                    const origin = this._vec3(f.origin);
+                    const tangent = this._vec3(f.tangent);
+                    const normal = this._vec3(f.normal);
+                    const binormal = this._vec3(f.binormal);
+                    if (!origin || !tangent || !normal || !binormal) continue;
+                    frames.push({
+                        v: (typeof f.v === 'number') ? f.v : frames.length,
+                        origin, tangent, normal, binormal,
+                    });
+                }
+            }
+        }
+        const sp = this.parseSamplingPlane(jsonData);
+        if (sp) {
+            for (const s of sp) {
+                if (!s || typeof s !== 'object') continue;
+                const origin = this._vec3(s.origin);
+                const normal = this._vec3(s.normal);
+                const u = this._vec3(s.axis_u);
+                const v = this._vec3(s.axis_v);
+                if (!origin || !normal || !u || !v) continue;
+                if (u[0]*u[0] + u[1]*u[1] + u[2]*u[2] < 1e-12) continue;
+                if (v[0]*v[0] + v[1]*v[1] + v[2]*v[2] < 1e-12) continue;
+                samplingPlanes.push({
+                    v: (typeof s.v === 'number') ? s.v : samplingPlanes.length,
+                    origin, normal, axis_u: u, axis_v: v,
+                });
+            }
+        }
+        return { frames, samplingPlanes };
+    }
+
+    /** First 3 finite components of an array-like, or null. */
+    static _vec3(a) {
+        return (Array.isArray(a) && a.length >= 3
+            && Number.isFinite(a[0]) && Number.isFinite(a[1]) && Number.isFinite(a[2]))
+            ? [a[0], a[1], a[2]] : null;
     }
 
     /** spec 0002: top-level `moving_frame[]` (one per spine v-station). */
