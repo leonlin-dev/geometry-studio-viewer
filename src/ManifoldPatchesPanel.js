@@ -236,6 +236,22 @@ export class ManifoldPatchesPanel {
         root.appendChild(viewport);
         root.appendChild(sidePanel);
 
+        // Honest empty state for the NominalManifold layer: the nominal
+        // manifold (pre-constraint Hermite-blended control grid,
+        // intermediate_products.s_norm_cp) is a pipeline INTERMEDIATE and
+        // per kernel CONTEXT.md is never delivered as the answer, so many
+        // gallery outputs simply do not carry it. Show an explicit notice
+        // instead of a silently empty layer (never substitute the
+        // constrained `surface`/`surfaces[]` patches — different objects).
+        const emptyState = document.createElement('div');
+        emptyState.className = 'manifold-patches-empty-state';
+        emptyState.style.display = 'none';
+        emptyState.textContent =
+            'Nominal manifold not present in this dataset '
+            + '(no intermediate_products.s_norm_cp in the output JSON). '
+            + 'Only patch layers (FreeBlend3D / AffineTransport) are shown.';
+        viewport.appendChild(emptyState);
+
         root.style.width = '100%';
         root.style.height = '100%';
         root.style.display = 'flex';
@@ -248,7 +264,7 @@ export class ManifoldPatchesPanel {
         sidePanel.style.maxWidth = '320px';
 
         this.container.appendChild(root);
-        this._dom = { root, viewport, sidePanel };
+        this._dom = { root, viewport, sidePanel, emptyState };
     }
 
     // ---- Three.js scaffolding --------------------------------------------
@@ -431,6 +447,13 @@ export class ManifoldPatchesPanel {
     _applyData(caseData) {
         this._clearVizGroups();
         const byKind = this._partitionSurfaces(caseData);
+
+        // Explicit empty state when the dataset carries no nominal
+        // manifold (see _buildDom). Idempotent on update().
+        if (this._dom && this._dom.emptyState) {
+            this._dom.emptyState.style.display =
+                byKind.NominalManifold.length === 0 ? 'flex' : 'none';
+        }
 
         for (const kind of RESULT_KINDS) {
             for (const desc of byKind[kind]) {

@@ -206,6 +206,8 @@ export class GeometryParser {
             profiles: ['profiles', 'profile_indices', 'profile_ids'],
             kind: ['kind', 'type', 'coupling_kind'],
             label: ['label', 'name'],
+            tangent: ['tangent', 'tangent_vector'],
+            color: ['color'],
         };
         const GB_ALIASES = {
             guide_index: ['guide_index', 'guide', 'guide_id'],
@@ -222,6 +224,7 @@ export class GeometryParser {
         };
 
         const couplingPoints = [];
+        const explicitLines = [];
         const cpListRaw = pick(raw, ['coupling_points', 'couplingPoints', 'points']);
         if (Array.isArray(cpListRaw)) {
             for (const cp of cpListRaw) {
@@ -243,6 +246,26 @@ export class GeometryParser {
                         : [],
                     kind,
                     label: (typeof labelRaw === 'string') ? labelRaw : '',
+                    tangent: readVec3(pick(cp, CP_ALIASES.tangent)),
+                    color: (typeof pick(cp, CP_ALIASES.color) === 'string') ? pick(cp, CP_ALIASES.color) : '',
+                });
+            }
+        }
+
+        // Explicit cross-profile line segments (backend emits ready-made
+        // world-space segments instead of — or in addition to — grouped
+        // coupling points). Each entry: { from:[x,y,z], to:[x,y,z], color? }.
+        const linesRaw = pick(raw, ['lines', 'ruling_lines', 'segments']);
+        if (Array.isArray(linesRaw)) {
+            for (const ln of linesRaw) {
+                if (!ln || typeof ln !== 'object') continue;
+                const from = readVec3(pick(ln, ['from', 'start', 'a']));
+                const to = readVec3(pick(ln, ['to', 'end', 'b']));
+                if (!from || !to) continue;
+                explicitLines.push({
+                    from,
+                    to,
+                    color: (typeof ln.color === 'string') ? ln.color : '',
                 });
             }
         }
@@ -266,8 +289,13 @@ export class GeometryParser {
             }
         }
 
-        if (couplingPoints.length === 0 && guideBindings.length === 0) return null;
-        return { coupling_points: couplingPoints, guide_bindings: guideBindings };
+        if (couplingPoints.length === 0 && guideBindings.length === 0
+            && explicitLines.length === 0) return null;
+        return {
+            coupling_points: couplingPoints,
+            guide_bindings: guideBindings,
+            lines: explicitLines,
+        };
     }
 
     /**
@@ -286,6 +314,35 @@ export class GeometryParser {
             console.warn('GeometryParser: failed to normalize profile_coupling —', e);
             return null;
         }
+    }
+
+    /**
+     * Convert a legacy `debug.stage1_coupling` envelope (seams +
+     * ruling_lines) into the SAME normalized layer model produced by
+     * normalizeProfileCoupling(), so the viewer and the merged
+     * "Profile Coupling" panel have a single rendering path:
+     *   - each seam.start_point → a coupling point (kind 'declared',
+     *     profiles [profile_index] when valid, tangent kept for the
+     *     arrow decoration);
+     *   - each ruling_line → an explicit segment in `lines`
+     *     (ruling-line endpoints ARE world-space points — they are
+     *     passed through verbatim, no offset/scale).
+     * Returns null when the envelope parses to nothing.
+     */
+    static stage1ToProfileCoupling(stage1) {
+        if (!stage1 || typeof stage1 !== 'object') return null;
+        const raw = {
+            coupling_points: (Array.isArray(stage1.seams) ? stage1.seams : []).map((s) => ({
+                position: s && s.start_point,
+                tangent: s && (s.tangent || s.tangent_vector),
+                profiles: (s && Number.isInteger(s.profile_index) && s.profile_index >= 0)
+                    ? [s.profile_index] : [],
+                label: s ? s.label : undefined,
+                color: s ? s.color : undefined,
+            })),
+            ruling_lines: Array.isArray(stage1.ruling_lines) ? stage1.ruling_lines : [],
+        };
+        return this.normalizeProfileCoupling(raw);
     }
 
     /**

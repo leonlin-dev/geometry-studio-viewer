@@ -148,6 +148,21 @@ class App {
             manifoldPatchesContainer.style.display = showManifoldPatches ? 'flex' : 'none';
         }
 
+        if (showScene && this.viewer) {
+            // Tab 2 (coupling) and Tab 5 (manifold-patches) entry both call
+            // viewer.hideSurfaces(); nothing else ever calls showSurfaces(),
+            // so returning to the 3D Scene left the output surfaces hidden
+            // (scene rendering corruption). Restore visibility and re-sync
+            // the renderer to its container; both calls are idempotent for
+            // repeated switches.
+            if (typeof this.viewer.showSurfaces === 'function') {
+                this.viewer.showSurfaces();
+            }
+            if (typeof this.viewer.handleResize === 'function') {
+                this.viewer.handleResize();
+            }
+        }
+
         if (name === 'coupling') {
             // Order matters: layout must exist before reparenting so
             // #coupling-viewport is queryable.
@@ -224,17 +239,29 @@ class App {
         if (this.viewer.auditLayers && this.viewer.auditLayers.debug_markers) {
             this.viewer.auditLayers.debug_markers.visible = false;
         }
-        // Stage 1 overlays default OFF on first entry; the user can
-        // toggle them via the side panel.
-        this.viewer.setStage1Visibility(false, false, false);
+        // Stage 1 coupling overlays are built by the merged
+        // profile-coupling path in loadData; on tab entry nothing to
+        // force-hide (the panel checkboxes own per-layer visibility).
     }
 
     _detachCouplingViewport() {
         if (!this.viewer || !this.viewer.renderer) return;
         const sceneContainer = document.getElementById('app');
-        if (sceneContainer && this.viewer.renderer.domElement
-            && this.viewer.renderer.domElement.parentNode !== sceneContainer) {
-            sceneContainer.appendChild(this.viewer.renderer.domElement);
+        const canvas = this.viewer.renderer.domElement;
+        if (!sceneContainer || !canvas) return;
+        // Restore BOTH the parent and the original child order. At
+        // startup #app is [canvas, Tweakpane pane] — the pane (mounted
+        // by UIController with container: #app) is appended AFTER the
+        // canvas and must stay below the fold. A plain appendChild()
+        // here would move the canvas to the END of #app, i.e. AFTER the
+        // pane, flipping Tab 1 into the broken "panel on top half,
+        // canvas squeezed into bottom half" layout. insertBefore the
+        // first child puts the canvas back in front of the pane and is
+        // a no-op when the order is already correct, so repeated tab
+        // switches are stable.
+        if (canvas.parentNode !== sceneContainer
+            || canvas !== sceneContainer.firstChild) {
+            sceneContainer.insertBefore(canvas, sceneContainer.firstChild);
             this.viewer.handleResize();
         }
     }
@@ -244,10 +271,7 @@ class App {
         if (!container) return;
         if (!this.couplingPanel) {
             this.couplingPanel = this.ui ? this.ui.createCouplingPanel(container, {
-                onSeamMarkersToggle: (v) => this.viewer.setSeamMarkersVisibility(v),
-                onTangentArrowsToggle: (v) => this.viewer.setTangentArrowsVisibility(v),
-                onRulingLinesToggle: (v) => this.viewer.setRulingLinesVisibility(v),
-                onProfileCouplingToggle: (kind, v) => this.viewer.setProfileCouplingLayerVisibility(kind, v),
+                onCouplingLayerToggle: (kind, v) => this.viewer.setProfileCouplingLayerVisibility(kind, v),
             }) : null;
         }
         if (this.couplingPanel && this.currentCaseData) {
@@ -836,27 +860,23 @@ class App {
             this.viewer.hideSurfaces();
         }
 
-        // Stage-1 (Profile Coupling) debug overlays — populate the
-        // three Groups (seam markers / tangent arrows / ruling lines)
-        // from case.debug.stage1_coupling when present. The renderer
-        // handles missing input as a no-op + console.info.
-        this.viewer.setCouplingDebug(debug ? debug.stage1_coupling : null);
-        // Top-level `profile_coupling` overlays: built when present,
-        // cleared + hidden when absent (null) so absence of the key is
-        // visually identical to pre-`profile_coupling` cases.
-        this.viewer.setProfileCoupling(profileCoupling || null);
-        if (this.couplingPanel && typeof this.couplingPanel.resetProfileCouplingToggles === 'function') {
-            this.couplingPanel.resetProfileCouplingToggles();
+        // Merged coupling pipeline: top-level `profile_coupling` wins;
+        // legacy `debug.stage1_coupling` is normalized through the same
+        // layer model (stage1ToProfileCoupling) so one panel + one
+        // renderer serve both. When neither exists, setProfileCoupling
+        // clears/hides the group and the panel shows the explicit
+        // empty state. The legacy Stage-1 groups stay force-hidden
+        // (stale children from a previous case must never reappear).
+        this.viewer.setCouplingDebug(null);
+        const couplingModel = profileCoupling
+            || GeometryParser.stage1ToProfileCoupling(debug ? debug.stage1_coupling : null);
+        this.viewer.setProfileCoupling(couplingModel);
+        if (this.couplingPanel && typeof this.couplingPanel.resetCouplingToggles === 'function') {
+            this.couplingPanel.resetCouplingToggles();
         }
-        // Reset Stage-1 + Stage-2 checkboxes on every case change so a
-        // reviewer can't be left looking at seam markers from a
-        // previous case that the current case doesn't actually carry.
-        // Stage 1 toggles now live on Tab 2's coupling panel; Stage 2
-        // toggles stay on Tab 1's panel.
+        // Reset Stage-2 checkboxes on every case change so a reviewer
+        // can't be left looking at stale Stage-2 state.
         if (this.ui) {
-            if (this.couplingPanel && typeof this.couplingPanel.resetStage1Toggles === 'function') {
-                this.couplingPanel.resetStage1Toggles();
-            }
             if (typeof this.ui.resetStage2Toggles === 'function') this.ui.resetStage2Toggles();
         }
 

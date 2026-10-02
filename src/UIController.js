@@ -285,7 +285,7 @@ export class UIController {
 
     /**
      * Reset Stage-2 toggles. Stage 1 toggles now live on the Tab 2
-     * coupling panel and are reset via couplingPanel.resetStage1Toggles().
+     * coupling panel and are reset via couplingPanel.resetCouplingToggles().
      */
     resetStage2Toggles() {
         if (!this.stage2Params) return;
@@ -298,7 +298,7 @@ export class UIController {
      * Tweakpane instance mounted inside #coupling-container (NOT the
      * main #app pane), with Stage 1 overlay toggles and a per-profile
      * diagnostics table. The returned object exposes refresh(caseData),
-     * dispose() and resetStage1Toggles() so main.js can drive it from
+     * dispose() and resetCouplingToggles() so main.js can drive it from
      * outside.
      *
      * The diagnostics table reads the optional `is_closed`,
@@ -339,37 +339,27 @@ export class UIController {
             expanded: true,
         });
         const params = {
-            showSeamMarkers: false,
-            showTangentArrows: false,
-            showRulingLines: false,
             showCouplingPoints: true,
             showCouplingLines: true,
             showGuideBindings: true,
         };
-        const stage1Folder = sidePane.addFolder({
-            title: 'Stage 1 Overlays',
+        // Single merged layer model. Both data sources flow through the
+        // same three layers (GeometryParser.stage1ToProfileCoupling
+        // normalizes legacy debug.stage1_coupling into the
+        // profile_coupling shape before rendering):
+        //   points  → coupling points (legacy: seam markers + tangents)
+        //   lines   → cross-profile lines (legacy: ruling lines)
+        //   guide_bindings → guide bindings (top-level source only)
+        const folder = sidePane.addFolder({
+            title: 'Profile Coupling Layers',
             expanded: true,
         });
-        stage1Folder.addBinding(params, 'showSeamMarkers', { label: 'Seam Markers' })
-            .on('change', (ev) => callbacks.onSeamMarkersToggle && callbacks.onSeamMarkersToggle(ev.value));
-        stage1Folder.addBinding(params, 'showTangentArrows', { label: 'Tangent Arrows' })
-            .on('change', (ev) => callbacks.onTangentArrowsToggle && callbacks.onTangentArrowsToggle(ev.value));
-        stage1Folder.addBinding(params, 'showRulingLines', { label: 'Ruling Lines' })
-            .on('change', (ev) => callbacks.onRulingLinesToggle && callbacks.onRulingLinesToggle(ev.value));
-
-        // Top-level `profile_coupling` overlays. Visible by default
-        // when the case carries data; the bindings dispatch through
-        // callbacks.onProfileCouplingToggle(kind, visible).
-        const pcFolder = sidePane.addFolder({
-            title: 'Profile Coupling Data',
-            expanded: true,
-        });
-        pcFolder.addBinding(params, 'showCouplingPoints', { label: 'Coupling Points' })
-            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('points', ev.value));
-        pcFolder.addBinding(params, 'showCouplingLines', { label: 'Connection Lines' })
-            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('lines', ev.value));
-        pcFolder.addBinding(params, 'showGuideBindings', { label: 'Guide Bindings' })
-            .on('change', (ev) => callbacks.onProfileCouplingToggle && callbacks.onProfileCouplingToggle('guide_bindings', ev.value));
+        folder.addBinding(params, 'showCouplingPoints', { label: 'Coupling Points' })
+            .on('change', (ev) => callbacks.onCouplingLayerToggle && callbacks.onCouplingLayerToggle('points', ev.value));
+        folder.addBinding(params, 'showCouplingLines', { label: 'Cross-profile Lines' })
+            .on('change', (ev) => callbacks.onCouplingLayerToggle && callbacks.onCouplingLayerToggle('lines', ev.value));
+        folder.addBinding(params, 'showGuideBindings', { label: 'Guide Bindings' })
+            .on('change', (ev) => callbacks.onCouplingLayerToggle && callbacks.onCouplingLayerToggle('guide_bindings', ev.value));
 
         const pcSummary = document.createElement('div');
         pcSummary.style.fontFamily = 'monospace';
@@ -377,21 +367,35 @@ export class UIController {
         pcSummary.style.lineHeight = '1.5';
         pcSummary.style.padding = '4px 6px';
         pcSummary.style.color = '#333';
-        pcFolder.element.appendChild(pcSummary);
+        folder.element.appendChild(pcSummary);
+        // Source resolution: top-level `profile_coupling` wins; legacy
+        // `debug.stage1_coupling` gets a subtle tag; neither → explicit
+        // empty state (never silent).
         const renderCouplingSummary = (caseData) => {
             pcSummary.innerHTML = '';
-            const pc = (caseData && caseData.debug && caseData.debug.profile_coupling) || null;
-            if (!pc) {
-                pcSummary.innerHTML = '<div style="color:#888;">No profile_coupling data for this case.</div>';
+            const pc = (caseData && caseData.profile_coupling)
+                || (caseData && caseData.profileCoupling) || null;
+            const legacy = (caseData && caseData.debug
+                && caseData.debug.stage1_coupling) || null;
+            if (!pc && !legacy) {
+                pcSummary.innerHTML = '<div style="color:#999;font-style:italic;">'
+                    + 'No coupling data in this case.</div>';
                 return;
             }
-            const pts = Array.isArray(pc.coupling_points) ? pc.coupling_points : [];
-            const gbs = Array.isArray(pc.guide_bindings) ? pc.guide_bindings : [];
-            const declared = pts.filter((p) => p.kind === 'declared').length;
+            const pts = (pc && Array.isArray(pc.coupling_points)) ? pc.coupling_points
+                : (legacy && Array.isArray(legacy.seams)) ? legacy.seams : [];
+            const lineCount = (pc && Array.isArray(pc.lines) ? pc.lines.length : 0)
+                + (legacy && Array.isArray(legacy.ruling_lines) ? legacy.ruling_lines.length : 0);
+            const gbs = (pc && Array.isArray(pc.guide_bindings)) ? pc.guide_bindings : [];
+            const declared = pts.filter((p) => (p.kind ? p.kind === 'declared' : true)).length;
             const derived = pts.length - declared;
-            pcSummary.innerHTML =
-                `<div>points: ${pts.length} <span style="color:#1e88e5;">(${declared} declared)</span>`
+            const sourceTag = pc
+                ? '<div style="color:#555;">source: profile_coupling</div>'
+                : '<div style="color:#999;font-size:10px;">legacy stage1 data</div>';
+            pcSummary.innerHTML = sourceTag
+                + `<div>points: ${pts.length} <span style="color:#1e88e5;">(${declared} declared)</span>`
                 + ` <span style="color:#fb8c00;">(${derived} derived)</span></div>`
+                + `<div>cross-profile lines: ${lineCount}</div>`
                 + `<div>guide bindings: ${gbs.length}</div>`;
         };
 
@@ -465,13 +469,7 @@ export class UIController {
                 renderTable(caseData);
                 renderCouplingSummary(caseData);
             },
-            resetStage1Toggles() {
-                params.showSeamMarkers = false;
-                params.showTangentArrows = false;
-                params.showRulingLines = false;
-                sidePane.refresh();
-            },
-            resetProfileCouplingToggles() {
+            resetCouplingToggles() {
                 params.showCouplingPoints = true;
                 params.showCouplingLines = true;
                 params.showGuideBindings = true;

@@ -304,6 +304,7 @@ export class Viewer3D {
             this.markersGroup.position.copy(offset);
             this.nurbsGroup.position.copy(offset);
             this.auditGroup.position.copy(offset);
+            this._applyCouplingWorldOffset(offset);
             // Move the world grids + axes by the same offset so the
             // XY / XZ planes remain visually anchored to the data.
             this.grid && this.grid.position.copy(offset);
@@ -1370,12 +1371,18 @@ export class Viewer3D {
 
     /**
      * Build the profile-coupling visualization from a normalized
-     * GeometryParser.parseProfileCoupling() envelope:
+     * GeometryParser.normalizeProfileCoupling() envelope (both the
+     * top-level `profile_coupling` key and the legacy
+     * `debug.stage1_coupling` — via stage1ToProfileCoupling — flow
+     * through this single path):
      *   - one marker per coupling point (sphere = declared, octahedron
-     *     = derived) with optional label sprite;
+     *     = derived) with optional label sprite and optional tangent
+     *     arrow (legacy seam tangent vectors);
      *   - one thick polyline per coupling group (points sharing the
      *     same `profiles` array), ordered by v — the cross-profile
-     *     connection chain; line color follows the group's kind;
+     *     connection chain; explicit world-space segments in `lines`
+     *     (legacy ruling_lines) are rendered verbatim in the same
+     *     group;
      *   - guide bindings as separate-styled markers (purple octahedron)
      *     in their own toggleable sub-group.
      * Missing/null input (key absent) clears the group and hides it —
@@ -1412,7 +1419,10 @@ export class Viewer3D {
             if (!cp || !Array.isArray(cp.position) || cp.position.length < 3) continue;
             const [x, y, z] = cp.position;
             const derived = cp.kind === 'derived';
-            const color = derived ? colors.derived : colors.declared;
+            let color = derived ? colors.derived : colors.declared;
+            if (typeof cp.color === 'string' && cp.color) {
+                color = this._hexFromColorString(cp.color, color);
+            }
             const geom = derived
                 ? new THREE.OctahedronGeometry(markerRadius, 0)
                 : new THREE.SphereGeometry(markerRadius, 16, 16);
@@ -1421,6 +1431,20 @@ export class Viewer3D {
             mesh.userData.label = cp.label || `cp_v${cp.v ?? '?'}`;
             mesh.userData.kind = derived ? 'coupling_point_derived' : 'coupling_point_declared';
             this.profileCouplingPointsGroup.add(mesh);
+            // Legacy seams may carry a per-point color + tangent vector;
+            // render the tangent as a small arrow on the points layer.
+            if (Array.isArray(cp.tangent) && cp.tangent.length >= 3) {
+                const dir = new THREE.Vector3(cp.tangent[0], cp.tangent[1], cp.tangent[2]);
+                if (dir.length() > 1e-9) {
+                    const arrowLen = Math.max(markerRadius * 4, diagonal * 0.05);
+                    const arrow = new THREE.ArrowHelper(
+                        dir.normalize(), new THREE.Vector3(x, y, z), arrowLen, color,
+                        arrowLen * 0.25, arrowLen * 0.12,
+                    );
+                    arrow.userData.kind = 'coupling_point_tangent';
+                    this.profileCouplingPointsGroup.add(arrow);
+                }
+            }
             if (cp.label) {
                 try {
                     const sprite = this._makeAnnoSprite(cp.label, color, 0.5);
@@ -1464,6 +1488,37 @@ export class Viewer3D {
             line.userData.kind = derived ? 'coupling_line_derived' : 'coupling_line_declared';
             line.userData.material = lineMat;
             this.profileCouplingLinesGroup.add(line);
+        }
+
+        // --- explicit cross-profile segments (legacy ruling_lines):
+        // world-space endpoints passed through verbatim, one thick
+        // segment + endpoint spheres per entry. ---
+        const explicitLines = Array.isArray(coupling.lines) ? coupling.lines : [];
+        for (const seg of explicitLines) {
+            if (!seg || !Array.isArray(seg.from) || !Array.isArray(seg.to)) continue;
+            if (seg.from.length < 3 || seg.to.length < 3) continue;
+            const fromV = new THREE.Vector3(seg.from[0], seg.from[1], seg.from[2]);
+            const toV = new THREE.Vector3(seg.to[0], seg.to[1], seg.to[2]);
+            const colorHex = this._hexFromColorString(seg.color, colors.lineDeclared);
+            const segGeom = new LineGeometry();
+            segGeom.setPositions([fromV.x, fromV.y, fromV.z, toV.x, toV.y, toV.z]);
+            const segMat = new LineMaterial({
+                color: colorHex,
+                linewidth: lineWidthPx,
+                transparent: true,
+                opacity: 0.9,
+                worldUnits: false,
+            });
+            segMat.resolution.set(window.innerWidth, window.innerHeight);
+            const segLine = new Line2(segGeom, segMat);
+            segLine.computeLineDistances();
+            segLine.userData.kind = 'coupling_line_segment';
+            segLine.userData.material = segMat;
+            this.profileCouplingLinesGroup.add(segLine);
+            const endGeom = new THREE.SphereGeometry(markerRadius, 12, 12);
+            const endMat = new THREE.MeshBasicMaterial({ color: colorHex });
+            this.profileCouplingLinesGroup.add(new THREE.Mesh(endGeom, endMat).translateX(fromV.x).translateY(fromV.y).translateZ(fromV.z));
+            this.profileCouplingLinesGroup.add(new THREE.Mesh(endGeom, endMat).translateX(toV.x).translateY(toV.y).translateZ(toV.z));
         }
 
         // --- guide bindings: separate style (purple octahedron) ---
@@ -1516,6 +1571,26 @@ export class Viewer3D {
         const mats = Array.isArray(obj.material) ? obj.material
             : (obj.material ? [obj.material] : []);
         mats.forEach((m) => m.dispose());
+    }
+
+    /**
+     * Apply the scene-recentering offset (nurbsGroup position pass in
+     * loadMesh / loadGuideBinding) to every coupling overlay group.
+     * Profile curves live under nurbsGroup and are shifted by
+     * -bboxCenter; the coupling overlays carry WORLD-space points from
+     * the JSON (ruling-line endpoints, coupling_point positions), so
+     * they must inherit the same offset or they render displaced by
+     * +bboxCenter relative to the profiles — the historical
+     * "lines not on the profiles" bug.
+     */
+    _applyCouplingWorldOffset(offset) {
+        const groups = [
+            this.seamMarkersGroup,
+            this.tangentArrowsGroup,
+            this.rulingLinesGroup,
+            this.profileCouplingGroup,
+        ];
+        for (const g of groups) { if (g) g.position.copy(offset); }
     }
 
     /**
@@ -2021,6 +2096,7 @@ export class Viewer3D {
             this.markersGroup.position.copy(offset);
             this.nurbsGroup.position.copy(offset);
             this.auditGroup.position.copy(offset);
+            this._applyCouplingWorldOffset(offset);
             const size = bbox.getSize(new THREE.Vector3()).length();
             this.camera.position.set(size, size, size);
             this.controls.target.set(0, 0, 0);
