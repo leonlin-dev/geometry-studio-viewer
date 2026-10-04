@@ -823,16 +823,10 @@ export class ManifoldPatchesPanel {
             const cp = cps[k];
             if (!cp || typeof cp !== 'object') return [];
             const w = (typeof cp.w === 'number') ? cp.w : 1.0;
-            if (Math.abs(w - 1.0) < 1e-9) {
-                out.push({ x: cp.x, y: cp.y, z: cp.z, w: 1.0 });
-            } else {
-                out.push({
-                    x: cp.x / w,
-                    y: cp.y / w,
-                    z: cp.z / w,
-                    w,
-                });
-            }
+            // Un-premultiplied contract: (x,y,z) are euclidean coords and
+            // w is kept separately — same as Viewer3D's control grid and
+            // the NURBSSurface evaluation path, which divides by w itself.
+            out.push({ x: cp.x, y: cp.y, z: cp.z, w });
         }
         return out;
     }
@@ -843,8 +837,9 @@ export class ManifoldPatchesPanel {
      * expect:
      * control_points as [{x,y,z,w}] plus num_cps_u / num_cps_v (and
      * degree_u / degree_v aliases). Flat control_points arrays (stride
-     * 3 or 4) are expanded into objects WITHOUT dividing by w — the
-     * existing helpers perform the homogeneous→euclidean division.
+     * 3 or 4) are expanded into objects as-is — control points follow
+     * the un-premultiplied contract (euclidean xyz + separate w), so no
+     * homogeneous division is performed anywhere in the cage helpers.
      * Returns null when the descriptor lacks the knots/degree data
      * needed to size the control grid.
      */
