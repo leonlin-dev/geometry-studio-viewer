@@ -158,6 +158,13 @@ class App {
             if (typeof this.viewer.showSurfaces === 'function') {
                 this.viewer.showSurfaces();
             }
+            // _enterCouplingView() force-hides the debug_markers layer on
+            // Tab 2 entry; restore it here so returning to the 3D Scene
+            // doesn't leave the debug overlay (curve control polygons etc.)
+            // invisible until the case is reloaded.
+            if (this.viewer.auditLayers && this.viewer.auditLayers.debug_markers) {
+                this.viewer.auditLayers.debug_markers.visible = true;
+            }
             if (typeof this.viewer.handleResize === 'function') {
                 this.viewer.handleResize();
             }

@@ -1119,9 +1119,17 @@ export class Viewer3D {
             } else if (m.kind === 'curve') {
                 const raw = m.data || [];
                 if (raw.length >= 6) {
+                    // The serializer (gallery_loader) de-homogenizes kernel
+                    // CPs at the data boundary: dim=4 markers carry xyzw with
+                    // cartesian x/y/z plus the true weight w, so no w
+                    // division is needed here. dim only decides the stride;
+                    // fall back to a length guess for legacy markers that
+                    // predate the explicit dim field.
+                    const dim = (m.dim === 3 || m.dim === 4)
+                        ? m.dim
+                        : (raw.length % 3 === 0 ? 3 : 4);
                     const pts = [];
-                    const stride = (raw.length % 3 === 0) ? 3 : 4;
-                    for (let i = 0; i < raw.length; i += stride) {
+                    for (let i = 0; i + dim <= raw.length; i += dim) {
                         pts.push(new THREE.Vector3(raw[i], raw[i+1], raw[i+2]));
                     }
                     const geom = new THREE.BufferGeometry().setFromPoints(pts);
