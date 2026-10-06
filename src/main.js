@@ -1,5 +1,5 @@
 import { Viewer3D } from './Viewer3D.js';
-import { GeometryParser } from './GeometryParser.js';
+import { GeometryParser, MATH_ERROR_TABLE } from './GeometryParser.js';
 import { UIController } from './UIController.js';
 import { ProtocolSource } from './data-sources/ProtocolSource.js';
 import { TimelinePanel } from './TimelinePanel.js';
@@ -820,6 +820,28 @@ class App {
                 + `</div>`;
         }
         infoHtml += `<div style="margin-bottom: 10px;"><strong>Intent Space:</strong><br/><span style="font-family: monospace; font-size: 11px; white-space: pre-wrap;">${jsonData.intent_space || 'N/A'}</span></div>`;
+
+        // kernel-algo error-code reflection (e2e driver "reflect, don't
+        // raise"): show every returned code together with its stable
+        // MathError name and the meaning mirrored from math_error.hpp.
+        const errorRecords = Array.isArray(jsonData.errors) ? jsonData.errors : [];
+        if (errorRecords.length > 0) {
+            const rows = errorRecords.map(e => {
+                const entry = MATH_ERROR_TABLE[e.code];
+                const name = entry ? entry.name : 'UNKNOWN_ERROR';
+                const meaning = entry ? entry.zh : '未知错误码（不在 math_error.hpp 冻结表中）';
+                const ctx = e.context ? ` <em>[${e.context}]</em>` : '';
+                const msg = e.message ? ` — ${e.message}` : '';
+                return `<div style="margin: 3px 0 3px 8px; font-family: monospace; font-size: 11px; color: #d32f2f;">`
+                    + `code=<strong>${e.code}</strong> ${name}${ctx}<br/>`
+                    + `<span style="color:#333;">内涵: ${meaning}${msg}</span></div>`;
+            }).join('');
+            infoHtml += `<div style="margin-bottom: 10px; border: 1px solid #d32f2f; border-radius: 4px; padding: 6px; background: #fdecea;">`
+                + `<strong style="color:#d32f2f;">kernel-algo 错误码 (${errorRecords.length}):</strong>${rows}</div>`;
+        } else {
+            infoHtml += `<div style="margin-bottom: 10px; font-size: 11px; color: #2e7d32;">kernel-algo 错误码: 无（errorCode = 0 / OK）</div>`;
+        }
+
         infoHtml += `<div><strong>Success Criteria:</strong><br/><span style="color: #2e7d32;">${jsonData.success_criteria || 'N/A'}</span></div>`;
 
         document.getElementById('case-description').innerHTML = infoHtml;
@@ -832,6 +854,8 @@ class App {
             const parsed = GeometryParser.parseGuideBinding(jsonData);
             const { surfaceLabels, curveLabels, auditLayers, guideBindingLayers } =
                 this.viewer.loadGuideBinding(parsed);
+            // Same closure-seam rendering as the generic path.
+            this.viewer.setClosureSeam(GeometryParser.parseClosureSeam(jsonData));
             if (this.ui) {
                 this.ui.updateGuideBindingPanel(
                     { surfaceLabels, curveLabels, guideBindingLayers, audit: parsed.audit },
@@ -846,12 +870,15 @@ class App {
             return;
         }
 
-        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug, profileCoupling } = GeometryParser.parseMesh(jsonData);
+        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug, profileCoupling, closureSeam } = GeometryParser.parseMesh(jsonData);
         // spec 0002: bundle aux-viz arrays; loadMesh builds the
         // groups AFTER bbox is known (scale = 0.1 × bbox_diagonal).
         const extras = { movingFrame, samplingPlane };
         const { surfaceLabels, curveLabels, auditLayers } =
             this.viewer.loadMesh(geometry, markers, nurbs, audit, extras);
+        // Closed-profile closure points (coincident start/end), joined
+        // by a black polyline in profile order. No-op on open profiles.
+        this.viewer.setClosureSeam(closureSeam);
 
         // Extract the persistent skeleton (Profiles + Spine + Guides) so
         // Tab 2 (coupling) and Tab 3 (timeline) can share a stable
@@ -1178,6 +1205,9 @@ class App {
 }
 
 const app = new App();
+// Debug/test handle: lets headless checks and browser-console sessions
+// inspect scene state (e.g. closureSeamGroup children) without a rebuild.
+window.__viewerApp = app;
 app.init();
 if (typeof window !== 'undefined') {
     window.__viewerApp = app;

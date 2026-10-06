@@ -32,12 +32,38 @@ function decorateCurves(curves) {
     });
 }
 
+// Stable MathError vocabulary mirrored from kernel-algo
+// include/loft14/math_error.hpp. Ordinals are frozen by contract; the
+// description strings paraphrase the ENTRY REFERENCE comments so the
+// viewer can surface each code's meaning (内涵) without a backend trip.
+export const MATH_ERROR_TABLE = {
+    0:  { name: 'OK',                                   zh: '成功哨兵：无错误' },
+    1:  { name: 'EMPTY_SECTIONS',                       zh: '未提供任何 profile 截面曲线' },
+    2:  { name: 'NO_SPINE',                             zh: '缺少 spine 脊线' },
+    3:  { name: 'PLANE_INTERSECT_FAIL',                 zh: 'profile 法平面与曲线求交失败' },
+    4:  { name: 'FAIRING_NO_CONVERGE',                  zh: '变分光顺（fairing）未收敛' },
+    5:  { name: 'TOPOLOGY_MISMATCH',                    zh: 'profiles/guides 开闭拓扑不一致' },
+    6:  { name: 'INVALID_INPUT',                        zh: '调用方输入违反前置条件' },
+    7:  { name: 'NUMERIC_INSTABILITY',                  zh: '迭代精化发散，数值不稳定' },
+    8:  { name: 'NOT_IMPLEMENTED',                      zh: '请求的 tag/scheme 未实现' },
+    9:  { name: 'KNOT_INSERTION_FAILED',                zh: 'B 样条节点插入失败' },
+    10: { name: 'KNOT_REMOVAL_FAILED',                  zh: 'B 样条节点删除失败' },
+    11: { name: 'DEGREE_ELEVATION_FAILED',              zh: 'B 样条升阶失败' },
+    12: { name: 'FIT_NON_CONVERGED',                    zh: '最小二乘拟合未收敛' },
+    13: { name: 'FIT_MATRIX_SINGULAR',                  zh: '拟合配置矩阵秩亏' },
+    14: { name: 'BASIS_DEGENERATE',                     zh: 'B 样条基退化（控制点过少）' },
+    15: { name: 'NEWTON_NO_CONVERGE',                   zh: 'Newton-Raphson 迭代未收敛' },
+    16: { name: 'HERMITE_FEASIBILITY_FAIL',             zh: 'Hermite 可行性检查失败' },
+    17: { name: 'CLOSEST_POINT_NO_BRACKET',             zh: '最近点搜索未找到括号区间' },
+    18: { name: 'SECTION_CONTINUITY_PROFILE_OOB',       zh: 'section-continuity 的 profile_index 越界' },
+    19: { name: 'SECTION_CONTINUITY_DOMAIN_OOB',        zh: 'section-continuity 的 u_param 超出目标曲线定义域' },
+    20: { name: 'SECTION_CONTINUITY_DEGREE_INFEASIBLE', zh: 'section-continuity 该类别要求 profile 次数 ≥ 3' },
+    21: { name: 'SECTION_CONTINUITY_CATEGORY_INVALID',  zh: 'section-continuity 类别 id 越界' },
+    22: { name: 'SECTION_CONTINUITY_SUPPORT_MISMATCH',  zh: 'support_surface 未在 (u_param, v_i) 处通过该截面' },
+    23: { name: 'POLICY_PREPARED_MISMATCH',             zh: 'policy 与不可变 prepared 输入矛盾（保留序号）' },
+};
+
 export class GeometryParser {
-    /**
-     * Parses the mesh data from the kernel JSON.
-     * @param {Object} jsonData
-     * @returns {THREE.BufferGeometry}
-     */
     static parseMesh(jsonData) {
         let geometry = new THREE.BufferGeometry();
         const meshData = jsonData.geometry ? jsonData.geometry.mesh : null;
@@ -90,7 +116,96 @@ export class GeometryParser {
             // mapping in normalizeProfileCoupling(); null when absent
             // so consumers guard with one null-check.
             profileCoupling: this.parseProfileCoupling(jsonData),
+            // kernel-algo error codes reflected by the e2e driver
+            // (top-level `errors` array). Empty array when the case ran
+            // clean so consumers can rely on the key.
+            errors: this.parseErrorCodes(jsonData),
+            // Closure-point polyline across closed profiles, in profile
+            // order. Empty array when no closed profile exists.
+            closureSeam: this.parseClosureSeam(jsonData),
         };
+    }
+
+    /**
+     * Parse the e2e driver's top-level `errors` array
+     * (gallery_loader write_case_envelope: `[{code, message, context}]`).
+     * Each record is decorated with the stable MathError name and the
+     * viewer-side meaning text mirrored from math_error.hpp, so the
+     * panel can show the code's 内涵 without a backend round-trip.
+     * Unknown ordinals fall back to "UNKNOWN_ERROR" and keep the
+     * backend-provided message. Returns [] when the field is absent.
+     */
+    static parseErrorCodes(jsonData) {
+        const list = jsonData && jsonData.errors;
+        if (!Array.isArray(list)) return [];
+        return list.map(e => {
+            if (!e || typeof e !== 'object') return null;
+            const code = (typeof e.code === 'number') ? e.code : NaN;
+            const entry = MATH_ERROR_TABLE[code];
+            return {
+                code,
+                name: entry ? entry.name : 'UNKNOWN_ERROR',
+                meaning: entry ? entry.zh : '未知错误码（不在 math_error.hpp 冻结表中）',
+                message: (typeof e.message === 'string') ? e.message : '',
+                context: (typeof e.context === 'string') ? e.context : '',
+            };
+        }).filter(Boolean);
+    }
+
+    /**
+     * Collect the closure point (the coincident starting/ending point)
+     * of every closed-curve profile, in profile order, for the black
+     * seam polyline rendered by Viewer3D.setClosureSeam().
+     *
+     * Profile sources, in priority order:
+     *   1. top-level `curves[]` entries with type 'section' (gallery
+     *      envelopes);
+     *   2. `input.profiles[]` (spec-0004 binding envelopes).
+     * A profile counts as closed when `is_periodic === true` or its
+     * first and last control points coincide within a relative
+     * tolerance (1e-9 × bbox diagonal of that profile's CPs, floored
+     * at 1e-12). Only closed profiles contribute a point; the returned
+     * records keep their original order so "按 profile 顺序" holds.
+     */
+    static parseClosureSeam(jsonData) {
+        if (!jsonData || typeof jsonData !== 'object') return [];
+        let profiles = [];
+        if (Array.isArray(jsonData.curves)) {
+            profiles = jsonData.curves.filter(c => c && (c.type === 'section'));
+        } else if (jsonData.input && Array.isArray(jsonData.input.profiles)) {
+            profiles = jsonData.input.profiles;
+        }
+
+        const records = profiles.map((c, index) => {
+            const src = Array.isArray(c.control_points) ? c.control_points : [];
+            if (src.length < 2) return null;
+            const first = src[0], last = src[src.length - 1];
+            const asXYZ = (p) => {
+                if (Array.isArray(p)) return [p[0], p[1], p[2]];
+                if (p && typeof p === 'object') return [p.x, p.y, p.z];
+                return null;
+            };
+            const a = asXYZ(first), b = asXYZ(last);
+            if (!a || !b) return null;
+            // Closure test: explicit flag wins; otherwise first≈last CP.
+            let closed = (c.is_periodic === true);
+            if (!closed) {
+                let diag = 0;
+                for (const p of src) {
+                    const q = asXYZ(p);
+                    if (!q) continue;
+                    diag = Math.max(diag,
+                        Math.hypot(q[0] - a[0], q[1] - a[1], q[2] - a[2]));
+                }
+                const tol = Math.max(diag * 1e-9, 1e-12);
+                closed = Math.hypot(a[0]-b[0], a[1]-b[1], a[2]-b[2]) <= tol;
+            }
+            if (!closed) return null;
+            return { profile_index: (typeof c.index === 'number') ? c.index : index,
+                     label: c.label || ('profile_' + index),
+                     point: a };
+        }).filter(Boolean);
+        return records;
     }
 
     /**

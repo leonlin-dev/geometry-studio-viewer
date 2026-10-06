@@ -42,6 +42,10 @@ export class Viewer3D {
         this.profileCouplingGroup.add(this.profileCouplingLinesGroup);
         this.profileCouplingGroup.add(this.profileCouplingGuideBindingsGroup);
         this.profileCouplingGroup.visible = false;
+        // Black polyline joining the closure points (coincident
+        // starting/ending points) of closed profiles, in profile order.
+        this.closureSeamGroup = new THREE.Group();
+        this.closureSeamGroup.visible = true;
         this.surfaceGroups = {};
         this.auditLayers = {};
         this.vSamplesPoints = null;
@@ -66,6 +70,7 @@ export class Viewer3D {
         this.scene.add(this.tangentArrowsGroup);
         this.scene.add(this.rulingLinesGroup);
         this.scene.add(this.profileCouplingGroup);
+        this.scene.add(this.closureSeamGroup);
 
         this.material = new THREE.MeshPhongMaterial({
             color: 0x4488ff,
@@ -143,7 +148,8 @@ export class Viewer3D {
         }
 
         [this.markersGroup, this.nurbsGroup, this.auditGroup,
-         this.seamMarkersGroup, this.tangentArrowsGroup, this.rulingLinesGroup].forEach(group => {
+         this.seamMarkersGroup, this.tangentArrowsGroup, this.rulingLinesGroup,
+         this.closureSeamGroup].forEach(group => {
             while(group.children.length > 0) {
                 const child = group.children[0];
                 if (child.geometry) child.geometry.dispose();
@@ -347,6 +353,48 @@ export class Viewer3D {
                 sphere.position.set(...marker.position);
                 this.markersGroup.add(sphere);
             }
+        });
+    }
+
+    /**
+     * Render the closure-point seam: for every closed-curve profile,
+     * take its coincident starting/ending point and join those points
+     * with a black polyline in profile order (spec: "按 profile 顺序
+     * 连成的线"). `records` comes from
+     * GeometryParser.parseClosureSeam(): [{profile_index, label, point}].
+     * A single closed profile yields no line (needs ≥ 2 points) but
+     * still gets its marker sphere. Case change clears the group via
+     * loadMesh's disposal loop.
+     */
+    setClosureSeam(records) {
+        while (this.closureSeamGroup.children.length > 0) {
+            const child = this.closureSeamGroup.children[0];
+            if (child.geometry) child.geometry.dispose();
+            if (child.material) child.material.dispose();
+            this.closureSeamGroup.remove(child);
+        }
+        if (!Array.isArray(records) || records.length === 0) return;
+
+        const points = records.map(r =>
+            new THREE.Vector3(r.point[0], r.point[1], r.point[2]));
+        if (points.length >= 2) {
+            const geom = new THREE.BufferGeometry().setFromPoints(points);
+            const line = new THREE.Line(geom,
+                new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 }));
+            line.userData.label = 'closure_seam';
+            this.closureSeamGroup.add(line);
+        }
+        // Marker spheres sized relative to the seam extent so they stay
+        // visible at any model scale.
+        const bbox = new THREE.Box3().setFromPoints(points);
+        const diag = bbox.isEmpty() ? 1 : bbox.min.distanceTo(bbox.max);
+        const radius = Math.max(diag * 0.01, 1e-6);
+        const sphereGeom = new THREE.SphereGeometry(radius, 12, 12);
+        const sphereMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+        points.forEach(pt => {
+            const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+            sphere.position.copy(pt);
+            this.closureSeamGroup.add(sphere);
         });
     }
 
