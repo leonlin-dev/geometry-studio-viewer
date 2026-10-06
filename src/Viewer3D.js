@@ -120,13 +120,15 @@ export class Viewer3D {
             // LineMaterial.resolution must track viewport or world-space line
             // width breaks after a resize.
             if (this.rulingLinesGroup) {
-                this.rulingLinesGroup.traverse((obj) => {
-                    if (obj.userData && obj.userData.material
-                        && obj.userData.material.resolution) {
-                        obj.userData.material.resolution.set(
-                            window.innerWidth, window.innerHeight,
-                        );
-                    }
+                [this.rulingLinesGroup, this.closureSeamGroup].forEach((grp) => {
+                    grp.traverse((obj) => {
+                        if (obj.userData && obj.userData.material
+                            && obj.userData.material.resolution) {
+                            obj.userData.material.resolution.set(
+                                window.innerWidth, window.innerHeight,
+                            );
+                        }
+                    });
                 });
             }
         });
@@ -178,6 +180,10 @@ export class Viewer3D {
 
         this.surfaceGroups = {};
         this.auditLayers = {};
+        // Closure points collected while addNurbs draws the profile
+        // curves (see addNurbs): the drawn curve's own start point, not
+        // CP[0], so the seam sits exactly on the rendered profile.
+        this._closureSeamRecords = [];
         const labels = [];
 
         if (geometry && geometry.attributes.position) {
@@ -225,6 +231,11 @@ export class Viewer3D {
         Object.keys(this.auditLayers).forEach(k => {
             this.auditLayers[k].visible = (k === 'couplings' || k === 'debug_markers');
         });
+
+        // Closure seam from the drawn profile curves' own start points
+        // (collected in addNurbs). Rendered here so it participates in
+        // the same case-change lifecycle as every other overlay.
+        this.setClosureSeam(this._closureSeamRecords);
 
         const bbox = new THREE.Box3();
         if (this.mesh && this.mesh.geometry && this.mesh.geometry.attributes.position) {
@@ -310,6 +321,7 @@ export class Viewer3D {
             this.markersGroup.position.copy(offset);
             this.nurbsGroup.position.copy(offset);
             this.auditGroup.position.copy(offset);
+            this.closureSeamGroup.position.copy(offset);
             this._applyCouplingWorldOffset(offset);
             // Move the world grids + axes by the same offset so the
             // XY / XZ planes remain visually anchored to the data.
@@ -373,14 +385,49 @@ export class Viewer3D {
             if (child.material) child.material.dispose();
             this.closureSeamGroup.remove(child);
         }
+        // The seam coordinates live in the case's raw model space, same
+        // as the curve geometry fed to addNurbs — but nurbsGroup carries
+        // the scene-recentering offset (position set at the end of
+        // loadMesh). Inherit it or the seam floats off the profiles.
+        this.closureSeamGroup.position.copy(this.nurbsGroup.position);
         if (!Array.isArray(records) || records.length === 0) return;
 
         const points = records.map(r =>
             new THREE.Vector3(r.point[0], r.point[1], r.point[2]));
+        // Always-on-top rendering: the black line would otherwise be
+        // hidden inside/beneath the output surface and the equally
+        // black section curves. depthTest=false + renderOrder lifts it
+        // above every opaque pass; a fat Line2 (screen-space width)
+        // with a white underlay stroke keeps it readable over the dark
+        // surface colors (plain Line linewidth is ignored by WebGL).
+        const ptsFlat = [];
+        points.forEach(pt => ptsFlat.push(pt.x, pt.y, pt.z));
+        const screenSize = () => Math.max(1, Math.min(window.innerWidth, window.innerHeight));
+        const seamWidthPx = Math.max(2, Math.min(4, screenSize() * 0.003));
+        const mkSeamLine = (color, widthPx, renderOrder) => {
+            const lineGeom = new LineGeometry();
+            lineGeom.setPositions(ptsFlat);
+            const lineMat = new LineMaterial({
+                color,
+                linewidth: widthPx,
+                transparent: true,
+                opacity: 0.95,
+                worldUnits: false,
+                depthTest: false,
+                depthWrite: false,
+            });
+            lineMat.resolution.set(window.innerWidth, window.innerHeight);
+            const line = new Line2(lineGeom, lineMat);
+            line.computeLineDistances();
+            line.renderOrder = renderOrder;
+            line.userData.material = lineMat;
+            line.userData.kind = 'closure_seam';
+            return line;
+        };
         if (points.length >= 2) {
-            const geom = new THREE.BufferGeometry().setFromPoints(points);
-            const line = new THREE.Line(geom,
-                new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 }));
+            // White halo (renderOrder 19) under the black stroke (20).
+            this.closureSeamGroup.add(mkSeamLine(0xffffff, seamWidthPx * 2.2, 19));
+            const line = mkSeamLine(0x000000, seamWidthPx, 20);
             line.userData.label = 'closure_seam';
             this.closureSeamGroup.add(line);
         }
@@ -390,9 +437,11 @@ export class Viewer3D {
         const diag = bbox.isEmpty() ? 1 : bbox.min.distanceTo(bbox.max);
         const radius = Math.max(diag * 0.01, 1e-6);
         const sphereGeom = new THREE.SphereGeometry(radius, 12, 12);
-        const sphereMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+        const sphereMat = new THREE.MeshBasicMaterial({ color: 0x000000,
+            depthTest: false, depthWrite: false });
         points.forEach(pt => {
             const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+            sphere.renderOrder = 21;
             sphere.position.copy(pt);
             this.closureSeamGroup.add(sphere);
         });
@@ -460,6 +509,30 @@ export class Viewer3D {
                         this.curveGroups[curveLabel].add(line);
                     } else {
                         this.nurbsGroup.add(line);
+                    }
+                    // Closed-profile closure point: use the drawn curve's
+                    // own start point. CP[0] only coincides with the curve
+                    // start for clamped splines; periodic/unclamped knots
+                    // put the real start elsewhere, and a CP-based seam
+                    // would float off the rendered profile. The drawn-
+                    // endpoint test (pts[0] ≈ pts[last]) is robust against
+                    // missing/incorrect is_periodic flags.
+                    if (data.type === 'section' && pts.length >= 2) {
+                        const start = pts[0], end = pts[pts.length - 1];
+                        if (Number.isFinite(start.x) && Number.isFinite(start.y) && Number.isFinite(start.z)
+                            && Number.isFinite(end.x) && Number.isFinite(end.y) && Number.isFinite(end.z)) {
+                            let extent = 0;
+                            for (const pt of pts) {
+                                extent = Math.max(extent, start.distanceTo(pt));
+                            }
+                            if (start.distanceTo(end) <= Math.max(extent * 1e-3, 1e-9)) {
+                                this._closureSeamRecords.push({
+                                    profile_index: this._closureSeamRecords.length,
+                                    label: curveLabel,
+                                    point: [start.x, start.y, start.z],
+                                });
+                            }
+                        }
                     }
                 } catch (e) { console.error(e); }
             });
@@ -2191,6 +2264,7 @@ export class Viewer3D {
             this.markersGroup.position.copy(offset);
             this.nurbsGroup.position.copy(offset);
             this.auditGroup.position.copy(offset);
+            this.closureSeamGroup.position.copy(offset);
             this._applyCouplingWorldOffset(offset);
             const size = bbox.getSize(new THREE.Vector3()).length();
             this.camera.position.set(size, size, size);

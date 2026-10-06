@@ -870,15 +870,14 @@ class App {
             return;
         }
 
-        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug, profileCoupling, closureSeam } = GeometryParser.parseMesh(jsonData);
+        const { geometry, markers, nurbs, audit, movingFrame, samplingPlane, debug, profileCoupling } = GeometryParser.parseMesh(jsonData);
         // spec 0002: bundle aux-viz arrays; loadMesh builds the
         // groups AFTER bbox is known (scale = 0.1 × bbox_diagonal).
         const extras = { movingFrame, samplingPlane };
         const { surfaceLabels, curveLabels, auditLayers } =
             this.viewer.loadMesh(geometry, markers, nurbs, audit, extras);
-        // Closed-profile closure points (coincident start/end), joined
-        // by a black polyline in profile order. No-op on open profiles.
-        this.viewer.setClosureSeam(closureSeam);
+        // Closed-profile closure seam is rendered inside loadMesh from
+        // the drawn curves' own start points (exact, no CP offset).
 
         // Extract the persistent skeleton (Profiles + Spine + Guides) so
         // Tab 2 (coupling) and Tab 3 (timeline) can share a stable
